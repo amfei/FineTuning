@@ -1,71 +1,80 @@
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, DataCollatorWithPadding
 from datasets import load_dataset
 
 # Step 1: Load the dataset
+# - The dataset used is "financial_phrasebank", which contains financial sentiment analysis data.
+# - "sentences_allagree" means that all annotators agreed on the sentiment labels.
+dataset = load_dataset("financial_phrasebank", "sentences_allagree", split="train")
 
+# Step 2: Split into training (80%) and evaluation (20%) sets
+# - The data is shuffled before splitting to ensure a more generalized model.
+split_dataset = dataset.train_test_split(test_size=0.2, seed=42, shuffle=True)
+train_dataset, eval_dataset = split_dataset["train"], split_dataset["test"]
 
-dataset = load_dataset("financial_phrasebank", "sentences_allagree", split="train")  # Load financial sentiment dataset
-print(dataset[100])  # Print the 100th sample to inspect the data
-print(dataset.column_names)  # Display the column names; typically 'sentence' and 'label'
+# Step 3: Load tokenizer and model
+# - Using DistilBERT (a lighter version of BERT) for sequence classification.
+# - Tokenizer converts text into numerical representations (token IDs).
+# - The model is initialized with 3 output labels (positive, neutral, negative sentiment).
+model_name = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=3)
 
-# Step 2: Split the dataset into training and evaluation sets
-# The dataset is split into 80% for training and 20% for evaluation (test) using a random seed to ensure reproducibility.
-split_dataset = dataset.train_test_split(test_size=0.2, seed=42)  # Split the data
-train_dataset = split_dataset["train"]  # Training dataset
-eval_dataset = split_dataset["test"]  # Evaluation (test) dataset
-
-# Step 3: Load the pre-trained tokenizer and model
-# Tokenizer: Converts raw text (sentences) into token IDs that the model understands.
-# Model: We are using "distilbert-base-uncased", a lighter version of BERT optimized for faster performance.
-
-model_name = "distilbert-base-uncased"  # Model name for a lightweight BERT model
-tokenizer = AutoTokenizer.from_pretrained(model_name)  # Load the tokenizer for text conversion
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=3)  # Load the model for 3 sentiment labels
-
-# Step 4: Preprocess the dataset by tokenizing the sentences
-# The tokenizer converts each sentence into a series of token IDs (numbers that represent the words).
-# Padding ensures that all sentences are of the same length, truncation limits the sentence to a fixed length.
+# Step 4: Tokenize dataset
+# - `truncation=True`: Ensures sentences longer than max length are truncated.
+# - `padding=True`: Pads shorter sentences so all inputs have equal length.
+# - `max_length=128`: Limits the number of tokens to prevent excessive computation.
 def preprocess_function(examples):
-    return tokenizer(examples["sentence"], truncation=True, padding="max_length")  # Tokenization and padding
+    return tokenizer(examples["sentence"], truncation=True, padding=True, max_length=128)
 
-# Apply preprocessing to the entire training and evaluation datasets
-train_dataset = train_dataset.map(preprocess_function, batched=True)  # Tokenize training data
-eval_dataset = eval_dataset.map(preprocess_function, batched=True)  # Tokenize evaluation data
+# Tokenizing the dataset in batches for better efficiency
+train_dataset = train_dataset.map(preprocess_function, batched=True, batch_size=1000)
+eval_dataset = eval_dataset.map(preprocess_function, batched=True, batch_size=1000)
 
-# Step 5: Format the datasets for PyTorch compatibility
-# The model requires the dataset to be in a specific format: it expects 'input_ids', 'attention_mask', and 'label' fields.
-# The 'input_ids' are the token IDs, and 'attention_mask' indicates which tokens are real (1) or padding (0).
-train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])  # Set PyTorch format for training
-eval_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])  # Set PyTorch format for evaluation
+# Step 5: Convert datasets to PyTorch tensors
+# - `input_ids`: The tokenized input sequences.
+# - `attention_mask`: Indicates which tokens are actual words (1) and which are padding (0).
+# - `label`: The sentiment label of the sentence.
+train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+eval_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-# Step 6: Define the training arguments
-# These arguments control the training process, such as batch size, learning rate, number of epochs, and more.
+# Step 6: Use DataCollatorWithPadding
+# - This ensures dynamic padding during training, optimizing GPU memory usage.
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+# Step 7: Define training arguments
 training_args = TrainingArguments(
-    output_dir="./results",  # Directory where model and checkpoints will be saved
-    eval_strategy="epoch",  # Evaluate the model at the end of each epoch
-    save_strategy="epoch",  # Save the model at the end of each epoch
-    logging_dir="./logs",  # Directory to save logs
-    learning_rate=2e-5,  # Learning rate used for optimization
-    per_device_train_batch_size=16,  # Batch size used during training (how many samples per batch)
-    num_train_epochs=3,  # Number of times the model will train on the entire dataset
-    weight_decay=0.01,  # Regularization parameter to prevent overfitting
-    report_to="none",  # Disable reporting to external tools like WandB
+    output_dir="./results",  # Where the model checkpoints will be saved
+    evaluation_strategy="epoch",  # Evaluate at the end of each epoch
+    save_strategy="epoch",  # Save model checkpoints at the end of each epoch
+    logging_dir="./logs",  # Directory for logs
+    learning_rate=2e-5,  # Optimized learning rate for fine-tuning
+    per_device_train_batch_size=16,  # Number of samples per training batch
+    per_device_eval_batch_size=16,  # Number of samples per evaluation batch
+    num_train_epochs=3,  # Number of times the model will see the entire dataset
+    weight_decay=0.01,  # Regularization to prevent overfitting
+    report_to="none",  # Disable external logging (e.g., WandB)
+    load_best_model_at_end=True,  # Save the best-performing model after training
+    fp16=True,  # Use mixed-precision training for faster performance on GPUs
 )
 
-# Step 7: Initialize the Trainer
-# The Trainer handles the training and evaluation of the model using the specified arguments and datasets.
+# Step 8: Initialize Trainer
+# - `Trainer` is a high-level class that simplifies fine-tuning Hugging Face models.
 trainer = Trainer(
-    model=model,  # Pre-trained model to fine-tune
-    args=training_args,  # Training arguments that control the training process
-    train_dataset=train_dataset,  # Tokenized training dataset
-    eval_dataset=eval_dataset,  # Tokenized evaluation dataset
+    model=model,  # The pre-trained model to fine-tune
+    args=training_args,  # Training arguments
+    train_dataset=train_dataset,  # The processed training dataset
+    eval_dataset=eval_dataset,  # The processed evaluation dataset
+    data_collator=data_collator,  # Handles dynamic padding
 )
 
-# Step 8: Fine-tune the model
-# The `train()` function starts the fine-tuning process where the model adjusts its weights based on the training data.
+# Step 9: Train the model
 trainer.train()
 
-# Step 9: Save the fine-tuned model for future use
-# After training, the model and tokenizer are saved to disk for later use (inference or further training).
-model.save_pretrained("./financial_sentiment_model")  # Save the fine-tuned model
-tokenizer.save_pretrained("./financial_sentiment_model")  # Save the tokenizer
+# Step 10: Evaluate the model after training
+eval_results = trainer.evaluate()
+print(f"Evaluation Results: {eval_results}")  # Displays model performance
+
+# Step 11: Save the fine-tuned model and tokenizer
+# - Saving ensures the model can be reloaded for future use without retraining.
+model.save_pretrained("./financial_sentiment_model")
+tokenizer.save_pretrained("./financial_sentiment_model")
